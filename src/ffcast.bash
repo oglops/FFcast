@@ -16,8 +16,8 @@
 # You should have received a copy of the GNU General Public License
 # along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
-if (( BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] < 3 )) ||
-   (( BASH_VERSINFO[0] < 4 )); then
+if ((BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] < 3)) ||
+   ((BASH_VERSINFO[0] < 4)); then
     printf 'fatal: requires bash 4.3+ but this is bash %s\n' "$BASH_VERSION"
     exit 43
 fi >&2
@@ -37,7 +37,7 @@ declare -A sub_commands=() sub_cmdfuncs=()
 declare -a rects=() regions=()
 declare -A heads=() windows=() heads_all=()
 declare -- {root_{w,h},rect_{w,h,x,y,X,Y}}=0
-declare -- borders=0 frame=0 frame_extents_support=1 intersection=0
+declare -- borders=0 frame=0 frame_support=1 intersect=0
 
 declare -A fmtmap=(
     ['D']='$DISPLAY'
@@ -72,46 +72,28 @@ trap_err() {
 } >&2
 
 _msg() {
-    local prefix=$1
-    shift || return 0
-    local fmt=$1
-    shift || return 0
-    printf '%s' "$prefix"
-    printf -- "$fmt\n" "$@"
+    printf '%s' "$1"
+    printf -- "$2\n" "${@:3}"
 }
 
 _quote_cmd_line() {
-    local prefix=$1
-    shift || return 0
-    local cmd=$1
-    shift || return 0
-    printf '%s' "$prefix"
-    printf '%q' "$cmd"
-    (( $# )) && printf ' %q' "$@"
+    printf '%s' "$1"
+    printf '%q' "$2"
+    shift 2
+    (($#)) && printf ' %q' "$@"
     printf '\n'
 }
 
-_report_array_by_key() {
-    local -n ref_array=$1
-    printf '%q[%q]=%q\n' "$1" "$2" "${ref_array[$2]}"
-}
-
-debug_array_by_key() {
-    (( verbosity >= 4 )) || return 0
-    printf '%s: ' "${logp[debug]}"
-    _report_array_by_key "$@"
-} >&2
-
 for ((i=0; i<${#logl[@]}; ++i)); do
     eval "${logl[i]}() {
-        (( verbosity >= $i )) || return 0
+        ((verbosity >= $i)) || return 0
         _msg \"\${logp[${logl[i]}]-${logl[i]}}: \" \"\$@\"
     } >&2"
 done
 
 for ((i=3; i<${#logl[@]}; ++i)); do
     eval "${logl[i]}_dryrun() {
-        (( verbosity >= $i )) || return 0
+        ((verbosity >= $i)) || return 0
         _quote_cmd_line \"\${logp[${logl[i]}]-${logl[i]}}: cmdline: \" \"\$@\"
     } >&2
     ${logl[i]}_run() {
@@ -123,29 +105,26 @@ done
 # $2: array variable to assign substitution results to
 # ${@:3} are strings to be substituted
 substitute_format_strings() {
-    local -n ref_fmtmap=$1
-    local -n ref_strarr=$2
+    local -n ref_fmtmap=$1 ref_strarr=$2
     shift 2
-    local noref_str
     ref_strarr=()
-    while (( $# )); do
-        noref_str=
+    while (($#)); do
+        ref_strarr+=('')
         printf '%s' "$1" |
         while IFS= read -r -n 1 -d ''; do
             if [[ $REPLY == '%' ]]; then
                 IFS= read -r -n 1 -d '' || :
                 if [[ -v ref_fmtmap[$REPLY] ]]; then
-                    eval "noref_str+=${ref_fmtmap[$REPLY]}"
+                    eval "ref_strarr[-1]+=${ref_fmtmap[$REPLY]}"
                 elif [[ $REPLY == '%' ]]; then
-                    noref_str+='%'
+                    ref_strarr[-1]+='%'
                 else
-                    noref_str+="%$REPLY"
+                    ref_strarr[-1]+="%$REPLY"
                 fi
             else
-                noref_str+=$REPLY
+                ref_strarr[-1]+=$REPLY
             fi
         done
-        ref_strarr+=("$noref_str")
         shift
     done
 }
@@ -156,11 +135,11 @@ printf '%s %s\n' max '>' min '<' | while IFS=' ' read -r mom cmp; do
         shift || return 1
         local {,_}{l,t,r,b}
         IFS=" " read l t r b <<< "$offsets"
-        for offsets in "$@"; do
+        for offsets; do
             [[ -n $offsets ]] || continue
             IFS=" " read _{l,t,r,b} <<< "$offsets"
             for o in l t r b; do
-                eval "(( (_$o '$cmp' $o) && ($o = _$o) )) || :"
+                eval "(((_$o '$cmp' $o) && ($o = _$o))) || :"
             done
         done
         printf "%d %d %d %d\n" "$l" "$t" "$r" "$b"
@@ -168,19 +147,44 @@ printf '%s %s\n' max '>' min '<' | while IFS=' ' read -r mom cmp; do
 done
 unset -v mom cmp
 
+set_region_vars_by_offsets() {
+    offsets=$(get_max_offsets "$offsets" '0 0 0 0')
+    debug 'sanitize offsets -> offsets="%s"' "$offsets"
+    IFS=' ' read rect_{x,y,X,Y} <<< "$offsets"
+    ((rect_w = root_w - rect_x - rect_X)) || :
+    ((rect_h = root_h - rect_y - rect_Y)) || :
+    set -- rect_{w,h,x,y,X,Y}
+    debug 'set region variables'
+    while (($#)); do
+        debug '\t%s' "$(declare -p "$1")"
+        shift
+    done
+    if ! ((rect_w > 0 && rect_h > 0)); then
+        error 'invalid region size: %sx%s' "$rect_w" "$rect_h"
+        return 1
+    fi
+}
+
 # $1: a geospec
 # $2: variable to assign offsets to
 set_region_by_geospec() {
-    local noref_region=$2
+    printf -v "$2" '%s' "$(get_region_by_geospec "$1")"
+}
+
+# stdout: offsets
+# $1: a geospec
+get_region_by_geospec() {
     local IFS
     # sanitize whitespaces
     IFS=$' \t'; set -- $1; set -- "$*"
     case $1 in
-        ?(-)+([0-9])+(\ |,)?(-)+([0-9])+(\ |,)?(-)+([0-9])+(\ |,)?(-)+([0-9]))  # x1,y1 x2,y2
+        # x1,y1 x2,y2
+        ?(-)+([0-9])+(\ |,)?(-)+([0-9])+(\ |,)?(-)+([0-9])+(\ |,)?(-)+([0-9]))
             IFS=' ,'
             set -- $1
             ;;
-        +([0-9])x+([0-9])\+?(-)+([0-9])\+?(-)+([0-9]))  # wxh+x+y
+        # wxh+x+y
+        +([0-9])x+([0-9])\+?(-)+([0-9])\+?(-)+([0-9]))
             IFS='x+'
             set -- $1
             set -- "$3" "$4" "$((root_w - $3 - $1))" "$((root_h - $4 - $2))"
@@ -190,21 +194,13 @@ set_region_by_geospec() {
             ;;
     esac
     IFS=' '
-    printf -v "$noref_region" '%s' "$*"
+    printf '%s' "$*"
 }
 
 # $1: variable to assign offsets to
 set_region_interactively() {
-    msg "%s" "please select a region using mouse"
+    msg '%s' "please select a region using mouse"
     printf -v "$1" '%s' "$(xrectsel '%x %y %X %Y')"
-}
-
-# $1: array variable to modify
-# $2: variable to assign window ID to
-set_window_interactively() {
-    msg "%s" "please click once in target window"
-    (( !frame || frame_extents_support )) || set -- "$1" "$2" -frame
-    xwininfo_get_window_by_ref "$@"
 }
 
 # $1: a window ID
@@ -220,59 +216,21 @@ set_window_by_id() {
     xwininfo_get_window_by_ref "$2" "$3" -id "$1"
 }
 
-# stdin: xdpyinfo -ext XINERAMA (preferably sanitized)
-# $1: array variable to assign heads to, i.e. =([id]=offsets ...)
-xdpyinfo_get_heads_by_ref() {
-    local -n ref_heads=$1
-    local IFS
-    while IFS=' ' read -r REPLY; do
-        REPLY=${REPLY#head #}
-        if [[ $REPLY == +([0-9]):\ +([0-9])x+([0-9])' @ '+([0-9]),+([0-9]) ]]; then
-            IFS=' :x@,'
-            set -- $REPLY
-            set -- "$1" "$4" "$5" "$((root_w - $4 - $2))" "$((root_h - $5 - $3))"
-            IFS=' '
-            ref_heads["$1"]="${*:2}"
-        fi
-    done
-    (( $# == 5 ))
-}
-
-xdpyinfo_list_heads() {
-    LC_ALL=C xdpyinfo -ext XINERAMA | grep '^  head #' | sed 's/^ *//'
-}
-
-# stdin: xwininfo output (locale: C)
-# stdout: wxh
-xwininfo_get_size() {
-    local IFS
-    set --
-    while IFS=$' \t' read -r REPLY; do
-        if [[ $REPLY == 'Width: '+([0-9]) ]]; then
-            set -- "${REPLY#'Width: '}" "$@"
-        elif [[ $REPLY == 'Height: '+([0-9]) ]]; then
-            set -- "$@" "${REPLY#'Height: '}"
-        else
-            continue
-        fi
-        if (( $# == 2 )); then
-            IFS=x
-            printf '%s\n' "$*"
-            return
-        fi
-    done
-    return 1
+# $1: array variable to modify
+# $2: variable to assign window ID to
+set_window_interactively() {
+    msg '%s' "please click once in target window"
+    xwininfo_get_window_by_ref "$1" "$2"
 }
 
 # $1: array variable to modify
 # $2: variable to assign window ID to
 # ${@:3} are passed to xwininfo
 xwininfo_get_window_by_ref() {
-    local -n ref_windows=$1
-    local -n ref_id=$2
-    export LC_ALL=C
-    xwininfo "${@:3}" |
-    awk -v borders="$borders" -v frame="$((frame && frame_extents_support))" '
+    local -n ref_windows=$1 ref_id=$2
+    local -x LC_ALL=C
+    xwininfo "${@:3}" `((!frame || frame_support)) || printf -- -frame` |
+    awk -v borders="$borders" -v frame="$((frame && frame_support))" '
     BEGIN { OFS = " " }
     /^xwininfo: Window id: 0x[[:xdigit:]]+ / { _id = $4 }
     /^ *Border width: [[:digit:]]+$/ { _bw = $3 }
@@ -304,11 +262,50 @@ xwininfo_get_window_by_ref() {
         print _ol, _ot, _or, _ob
     }' |
     {
-        read -r
-        ref_id=$REPLY
-        read -r
-        ref_windows["$ref_id"]=$REPLY
+        read -r; ref_id=$REPLY
+        read -r; ref_windows["$ref_id"]=$REPLY
     }
+}
+
+# stdout: wxh
+# $@: passed to xwininfo
+xwininfo_get_size() {
+    local -x LC_ALL=C
+    xwininfo "$@" |
+    sed -n '
+    $q1
+    /^  Width: \([0-9]\+\)$/!d
+    s//\1/; h; n
+    /^  Height: \([0-9]\+\)$/!q1
+    s//\1/; H; x; s/\n/x/; p; q'
+}
+
+# stdin: xdpyinfo -ext XINERAMA (preferably sanitized)
+# $1: array variable to assign heads to, i.e. =([id]=offsets ...)
+xdpyinfo_get_heads_by_ref() {
+    local -n ref_heads=$1
+    local IFS
+    while IFS=' ' read -r REPLY; do
+        REPLY=${REPLY#head #}
+        if [[ $REPLY == \
+            +([0-9]):\ +([0-9])x+([0-9])' @ '+([0-9]),+([0-9]) ]]; then
+            IFS=' :x@,'
+            set -- $REPLY
+            set -- "$1" "$4" "$5" "$((root_w -$4 -$2))" "$((root_h -$5 -$3))"
+            IFS=' '
+            ref_heads["$1"]="${*:2}"
+        fi
+    done
+    (($# == 5))
+}
+
+xdpyinfo_list_heads() {
+    local -x LC_ALL=C
+    xdpyinfo -ext XINERAMA |
+    sed -n '
+    /^XINERAMA extension not supported by xdpyinfo/ { p; q1 }
+    /^XINERAMA version/!d
+    :h; n; s/^  \(head #\)/\1/p; th; q'
 }
 
 run_default_command() {
@@ -318,15 +315,15 @@ run_default_command() {
 run_external_command() {
     local -- cmd=$1 extcmd
     shift || return 0
-    local -a args
+    local -a __args
     # always substitute format strings for external commands
-    substitute_format_strings fmtmap args "$@"
+    substitute_format_strings fmtmap __args "$@"
     # make sure it's an external command -- a disk file
     if ! extcmd=$(type -P "$cmd"); then
         error "external command '%s' not found" "$cmd"
         return 127
     fi
-    verbose_run command -- "$extcmd" "${args[@]}"
+    verbose_run command -- "$extcmd" "${__args[@]}"
 }
 
 run_subcmd_or_command() {
@@ -350,24 +347,6 @@ run_subcmd_or_command() {
     fi
 }
 
-set_region_vars_by_offsets() {
-    offsets=$(get_max_offsets "$offsets" '0 0 0 0')
-    debug "sanitize offsets -> offsets='%s'" "$offsets"
-    IFS=' ' read rect_{x,y,X,Y} <<< "$offsets"
-    (( rect_w = root_w - rect_x - rect_X )) || :
-    (( rect_h = root_h - rect_y - rect_Y )) || :
-    set -- rect_{w,h,x,y,X,Y}
-    debug 'set region variables'
-    while (( $# )); do
-        debug '\t%s' "$(declare -p "$1")"
-        shift
-    done
-    if ! (( rect_w > 0 && rect_h > 0 )); then
-        error 'invalid region size: %sx%s' "$rect_w" "$rect_h"
-        return 1
-    fi
-}
-
 #---
 # Process command line options and rectangles
 
@@ -377,7 +356,7 @@ usage() {
     cat <<EOF
 ffcast @VERSION@
 Usage:
-  ${0##*/} [options] [sub-command [args]] [command [args]]
+  ${0##*/} [options] [command [args]]
 
 Options:
   -g <geospec>  specify a region in numeric geometry
@@ -400,9 +379,9 @@ EOF
   exit "${1:-0}"
 }
 
-LC_ALL=C xwininfo -root | xwininfo_get_size | IFS=x read root_{w,h} || usage 1
+xwininfo_get_size -root | IFS=x read root_{w,h} || usage 1
 
-declare -- i=0 id= opt= var=
+declare -- i=0 id= opt= var= __id
 declare -a ids
 OPTIND=1
 while getopts ':#:bfg:hiqsvwx:' opt; do
@@ -411,7 +390,7 @@ while getopts ':#:bfg:hiqsvwx:' opt; do
         x)
             [[ $OPTARG != l?(ist) ]] || { xdpyinfo_list_heads; exit; }
             # cache list of all heads once
-            if (( ! ${#heads_all[@]} )); then
+            if ((!${#heads_all[@]})); then
                 if ! xdpyinfo_list_heads |
                     xdpyinfo_get_heads_by_ref heads_all; then
                     error 'failed to get all Xinerama heads'
@@ -426,13 +405,12 @@ while getopts ':#:bfg:hiqsvwx:' opt; do
                 IFS=' ,' read -a ids <<< "$OPTARG"
             fi
             for id in "${ids[@]}"; do
-                if [[ $id != +([0-9]) ]]; then
-                    warn "ignored invalid head ID: \'%s'" "$id"
-                elif [[ ! -v heads_all[$id] ]]; then
-                    warn "ignored non-existent head ID: \`%s'" "$id"
+                if [[ ! -v heads_all[$id] ]]; then
+                    warn "ignored invalid head ID: \`%s'" "$id"
                 else
                     heads[$id]=${heads_all[$id]}
-                    rects[i++]="heads[$id]"
+                    var="heads[$id]"
+                    rects[i++]=$var; verbose 'rect: %s="%s"' "$var" "${!var}"
                 fi
             done
             ;;
@@ -441,23 +419,23 @@ while getopts ':#:bfg:hiqsvwx:' opt; do
             if ! set_region_by_geospec "$OPTARG" "$var"; then
                 warn "ignored invalid geospec: \`%s'" "$OPTARG"
             else
-                rects[i++]=$var
+                rects[i++]=$var; verbose 'rect: %s="%s"' "$var" "${!var}"
             fi
             ;;
         s)
             var="regions[${#regions[@]}]"
             set_region_interactively "$var"
-            rects[i++]=$var
+            rects[i++]=$var; verbose 'rect: %s="%s"' "$var" "${!var}"
             ;;
        \#)
-            set_window_by_id "$OPTARG" windows id || exit
-            var="windows[$id]"
-            rects[i++]=$var
+            set_window_by_id "$OPTARG" windows __id || exit
+            var="windows[$__id]"
+            rects[i++]=$var; verbose 'rect: %s="%s"' "$var" "${!var}"
             ;;
         w)
-            set_window_interactively windows id
-            var="windows[$id]"
-            rects[i++]=$var
+            set_window_interactively windows __id
+            var="windows[$__id]"
+            rects[i++]=$var; verbose 'rect: %s="%s"' "$var" "${!var}"
             ;;
         b)
             borders=1
@@ -468,18 +446,18 @@ while getopts ':#:bfg:hiqsvwx:' opt; do
             verbose "windows: now including window manager frame"
             if ! LC_ALL=C xprop -root -notype _NET_SUPPORTED |
                 grep -qw _NET_FRAME_EXTENTS; then
-                frame_extents_support=0
+                frame_support=0
                 warn 'no _NET_FRAME_EXTENTS support; using xwininfo -frame'
             fi
             ;;
-        i)  intersection=1;;
-        q)  (( (verbosity > 0) && verbosity-- )) || :;;
-        v)  (( (verbosity < ${#logl[@]} - 1) && verbosity++ )) || :;;
+        i)  intersect=1;;
+        q)  ((verbosity > 0 && verbosity--)) || :;;
+        v)  ((verbosity < ${#logl[@]} - 1 && verbosity++)) || :;;
       '?')  warn "invalid option: \`%s'" "$OPTARG";;
       ':')  error "option requires an argument: \`%s'" "$OPTARG"; exit 1;;
     esac
 done
-shift $(( OPTIND - 1 ))
+shift $((OPTIND - 1))
 
 #---
 # Combine all rectangles
@@ -487,11 +465,11 @@ shift $(( OPTIND - 1 ))
 declare -- mom offsets=
 declare -n ref_rect
 
-(( intersection )) && mom=max || mom=min
+((intersect)) && mom=max || mom=min
 
 for ref_rect in "${rects[@]}"; do
-    offsets=$(get_"$mom"_offsets "$ref_rect" "${offsets}")
-    debug "get_%s_offsets -> offsets='%s'" "$mom" "$offsets"
+    offsets=$(get_"$mom"_offsets "$ref_rect" "$offsets")
+    debug 'get_%s_offsets -> offsets="%s"' "$mom" "$offsets"
 done
 : ${offsets:='0 0 0 0'}
 unset -n ref_rect
@@ -499,11 +477,11 @@ unset -v mom
 
 set_region_vars_by_offsets || exit
 
+# a little optimization
+(($#)) || { run_default_command; exit; }
+
 #---
 # Import predefined sub-commands
-
-# a little optimization
-(( $# )) || { run_default_command; exit; }
 
 for srcdir in "${srcdirs[@]}"; do
     subcmdsrc=$srcdir/subcmd
@@ -514,15 +492,8 @@ for srcdir in "${srcdirs[@]}"; do
 done
 unset -v srcdir subcmdsrc
 
-# make sure these are not defined as sub-commands
-for cmd in builtin command; do
-    unset -f $cmd
-    if [[ -v sub_commands[$cmd] ]]; then
-        unset -v sub_commands[$cmd]
-        warn 'unset sub-command %s' "$cmd"
-    fi
-done
-unset -v cmd
+# make sure these are not defined as functions
+unset -f builtin command
 
 #---
 # Execute
